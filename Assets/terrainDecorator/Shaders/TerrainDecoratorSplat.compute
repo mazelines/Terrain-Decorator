@@ -1,0 +1,47 @@
+#pragma kernel EvaluateLayerWeights
+#pragma kernel EvaluateDecorScanline
+
+#include "TerrainDecoratorSplatEval.cginc"
+
+RWTexture2DArray<float> _LayerResultWeights;
+RWStructuredBuffer<float> _LayerResultFlat;
+RWStructuredBuffer<float> _SplatScratch;
+
+[numthreads(8, 8, 1)]
+void EvaluateLayerWeights(uint3 id : SV_DispatchThreadID)
+{
+    int x = (int)id.x;
+    int y = (int)id.y;
+    int decorLayer = (int)id.z;
+
+    if (x >= _AlphamapWidth || y >= _AlphamapHeight || decorLayer >= _DecorLayerCount)
+        return;
+
+    float finalWeight = EvaluateDecorLayerAtPixel(decorLayer, x, y, _SplatScratch, false);
+    int flatIndex = decorLayer * _AlphamapWidth * _AlphamapHeight + PixelIndex(x, y);
+    _LayerResultWeights[uint3(x, y, decorLayer)] = finalWeight;
+    _LayerResultFlat[flatIndex] = finalWeight;
+}
+
+// Layer 필터: 픽셀 순서대로 splat 스크래치 갱신 (CPU map[x-1,y-1] 의존)
+[numthreads(1, 1, 1)]
+void EvaluateDecorScanline(uint3 id : SV_DispatchThreadID)
+{
+    int y = (int)id.y;
+    if (y >= _AlphamapHeight)
+        return;
+
+    int pixelCount = _AlphamapWidth * _AlphamapHeight;
+    for (int x = 0; x < _AlphamapWidth; x++)
+    {
+        int pixelIndex = PixelIndex(x, y);
+        for (int decorLayer = 0; decorLayer < _DecorLayerCount; decorLayer++)
+        {
+            float w = EvaluateDecorLayerAtPixel(decorLayer, x, y, _SplatScratch, true);
+            int flatIndex = decorLayer * pixelCount + pixelIndex;
+            _LayerResultFlat[flatIndex] = w;
+            _LayerResultWeights[uint3(x, y, decorLayer)] = w;
+        }
+        WriteSplatScratchFromLayerFlat(x, y, _LayerResultFlat, _SplatScratch);
+    }
+}
