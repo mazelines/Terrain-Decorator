@@ -1,4 +1,4 @@
-using UnityEngine;
+﻿using UnityEngine;
 using UnityEditor;
 using UnityEditorInternal;
 using System.Collections.Generic;
@@ -503,13 +503,14 @@ public class TerrainDecoratorEditor : Editor {
 		
 
 		decorator.fallOffDistance = EditorGUILayout.FloatField("smooth transition", decorator.fallOffDistance);
-		decorator.useGpuDecorate = EditorGUILayout.Toggle("GPU splat (editor)", decorator.useGpuDecorate);
+		decorator.useBakeCache = EditorGUILayout.Toggle("Bake cache (height/slope/painted/noise)", decorator.useBakeCache);
+		decorator.useGpuDecorate = EditorGUILayout.Toggle("GPU splat path (editor)", decorator.useGpuDecorate);
 		if (decorator.useGpuDecorate)
 		{
 			EditorGUILayout.HelpBox(
-				"Filters: Height, Slope, Painted, Noise, Texture, Layer. GPU rule evaluate ON uses CPU-matched bakes; Layer uses scanline kernel.",
+				"Height, Slope, Painted, Noise, Texture, Layer supported. Splat compositing stays on CPU (WriteSplatPixel). Layer filter uses GPU scanline.",
 				MessageType.None);
-			decorator.useGpuRuleEvaluate = EditorGUILayout.Toggle("GPU rule evaluate (experimental)", decorator.useGpuRuleEvaluate);
+			decorator.useGpuRuleEvaluate = EditorGUILayout.Toggle("GPU rule evaluate", decorator.useGpuRuleEvaluate);
 		}
 		if (decorator.useGpuDecorate && TerrainDecoratorGpu.HasActiveLayerFilterRule(decorator))
 			EditorGUILayout.HelpBox("Layer filter active: GPU uses scanline pass (pixel-order splat dependency).", MessageType.Info);

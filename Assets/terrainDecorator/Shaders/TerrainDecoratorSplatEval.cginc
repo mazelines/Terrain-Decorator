@@ -102,9 +102,8 @@ float SampleMask(int textureIndex, int x, int y, int channel)
     if (textureIndex < 0)
         return 0.0;
 
-    int sampleX = _AlphamapWidth - x - 1;
-    int sampleY = y;
-    float4 c = _MaskTextures.Load(int4(sampleX, sampleY, textureIndex, 0));
+    // Mask textures are built from CPU-baked float[] in alphamap (x,y) order (see TerrainDecoratorBakeCache).
+    float4 c = _MaskTextures.Load(int4(x, y, textureIndex, 0));
     if (channel == 0) return c.r;
     if (channel == 1) return c.g;
     if (channel == 2) return c.b;
@@ -113,7 +112,7 @@ float SampleMask(int textureIndex, int x, int y, int channel)
 
 float SamplePainted(int layerIndex, int x, int y)
 {
-    return _InputAlphamap.Load(int4(y, x, layerIndex, 0)).r;
+    return _InputAlphamap.Load(int4(x, y, layerIndex, 0)).r;
 }
 
 float SampleLayerSplat(RWStructuredBuffer<float> splatScratch, int x, int y, int targetLayer)

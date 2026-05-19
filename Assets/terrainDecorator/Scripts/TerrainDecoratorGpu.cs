@@ -11,8 +11,10 @@ public static class TerrainDecoratorGpu
     const int ThreadGroupSize = 8;
     const int MaxMaskTextures = 32;
     const int MaxTextureLayers = 32;
+    const float ParityEpsilon = 2e-2f;
 
-    [StructLayout(LayoutKind.Sequential, Size = 64)]
+    // HLSL RuleData / LayerData 와 동일 순서·크기 (StructuredBuffer stride 64 / 32)
+    [StructLayout(LayoutKind.Sequential, Pack = 4, Size = 64)]
     struct RuleDataGpu
     {
         public int filter;
@@ -33,7 +35,7 @@ public static class TerrainDecoratorGpu
         public int pad2;
     }
 
-    [StructLayout(LayoutKind.Sequential, Size = 32)]
+    [StructLayout(LayoutKind.Sequential, Pack = 4, Size = 32)]
     struct LayerDataGpu
     {
         public int active;
@@ -45,6 +47,9 @@ public static class TerrainDecoratorGpu
         public int pad1;
         public int pad2;
     }
+
+    const int RuleStrideBytes = 64;
+    const int LayerStrideBytes = 32;
 
     static ComputeShader _compute;
     static int _kernelEvaluate;
@@ -114,23 +119,167 @@ public static class TerrainDecoratorGpu
             return false;
         }
 
-        decorator.ProcessTextureFilters();
+        TerrainDecoratorBakeCache.TryAcquire(decorator, data, decorator.useBakeCache, out TerrainDecoratorBakeContext bake);
 
         int pixelCount = alphamapWidth * alphamapHeight;
-        var heightFlat = new float[pixelCount];
-        var slopeFlat = new float[pixelCount];
-        var falloffFlat = new float[pixelCount];
-        TerrainDecoratorSampling.BakeHeightMap(decorator, data, alphamapWidth, alphamapHeight, heightFlat);
-        TerrainDecoratorSampling.BakeSlopeMap(data, alphamapWidth, alphamapHeight, slopeFlat);
-        if (decorator.fallOfNoise)
-            TerrainDecoratorSampling.BakeFalloffNoiseMap(decorator, alphamapWidth, alphamapHeight, falloffFlat);
-        else
-            Array.Fill(falloffFlat, 0.5f);
+        if (!BuildRulesAndLayers(decorator, bake, alphamapWidth, alphamapHeight, pixelCount,
+                out List<RuleDataGpu> rulesGpu, out List<LayerDataGpu> layersGpu, out Texture2DArray maskArray))
+            return false;
 
-        var rulesGpu = new List<RuleDataGpu>();
-        var layersGpu = new List<LayerDataGpu>();
+        if (Marshal.SizeOf<RuleDataGpu>() != RuleStrideBytes || Marshal.SizeOf<LayerDataGpu>() != LayerStrideBytes)
+        {
+            Debug.LogError(
+                $"TerrainDecorator GPU: struct size mismatch (Rule={Marshal.SizeOf<RuleDataGpu>()}/{RuleStrideBytes}, Layer={Marshal.SizeOf<LayerDataGpu>()}/{LayerStrideBytes}).");
+            return false;
+        }
+
+        ComputeBuffer ruleBuffer = new ComputeBuffer(Mathf.Max(rulesGpu.Count, 1), RuleStrideBytes);
+        ComputeBuffer layerBuffer = new ComputeBuffer(Mathf.Max(layersGpu.Count, 1), LayerStrideBytes);
+        UploadRuleBuffer(ruleBuffer, rulesGpu);
+        UploadLayerBuffer(layerBuffer, layersGpu);
+
+        Texture2DArray inputAlphamap = bake.PaintedAlphamapTexture
+            ?? CreateDummyTexture2DArray(alphamapWidth, alphamapHeight, 1);
+        maskArray = maskArray ?? CreateDummyTexture2DArray(alphamapWidth, alphamapHeight, 1);
+
+        int layerFlatCount = Mathf.Max(decorLayerCount, 1) * pixelCount;
+        ComputeBuffer layerFlatBuffer = new ComputeBuffer(layerFlatCount, sizeof(float));
+        int splatScratchCount = Mathf.Max(pixelCount * textureLayerCount, 1);
+        ComputeBuffer splatScratchBuffer = new ComputeBuffer(splatScratchCount, sizeof(float));
+
+        var layerWeightsArray = new RenderTexture(alphamapWidth, alphamapHeight, 0, RenderTextureFormat.RFloat)
+        {
+            dimension = TextureDimension.Tex2DArray,
+            volumeDepth = Mathf.Max(decorLayerCount, 1),
+            enableRandomWrite = true
+        };
+        layerWeightsArray.Create();
+
+        bool useScanline = HasActiveLayerFilterRule(decorator);
+        bool ownsMaskArray = maskArray != null;
+
+        try
+        {
+            int kernel = useScanline ? _kernelScanline : _kernelEvaluate;
+            BindEvaluate(_compute, kernel, bake.HeightBuffer, bake.SlopeBuffer, bake.FalloffNoiseBuffer,
+                inputAlphamap, maskArray, ruleBuffer, layerBuffer, layerWeightsArray, layerFlatBuffer,
+                splatScratchBuffer, alphamapWidth, alphamapHeight, heightmapHeight, textureLayerCount,
+                decorLayerCount, decorator);
+
+            if (useScanline)
+            {
+                splatScratchBuffer.SetData(new float[splatScratchCount]);
+                _compute.Dispatch(_kernelScanline, 1, alphamapHeight, 1);
+            }
+            else
+            {
+                int gx = Mathf.CeilToInt(alphamapWidth / (float)ThreadGroupSize);
+                int gy = Mathf.CeilToInt(alphamapHeight / (float)ThreadGroupSize);
+                _compute.Dispatch(_kernelEvaluate, gx, gy, Mathf.Max(decorLayerCount, 1));
+            }
+
+            layerResultFlat = new float[layerFlatCount];
+            layerFlatBuffer.GetData(layerResultFlat);
+
+            if (!VerifyLayerWeightParity(decorator, data, layerResultFlat, out float[] cpuFlat))
+            {
+                Debug.LogWarning("TerrainDecorator GPU: parity failed — using CPU rule evaluate for this Decorate.");
+                layerResultFlat = cpuFlat;
+            }
+
+            splatMap = new float[alphamapWidth, alphamapHeight, textureLayerCount];
+            for (int y = 0; y < alphamapHeight; y++)
+            {
+                for (int x = 0; x < alphamapWidth; x++)
+                {
+                    decorator.ApplyLayerWeightsForPixel(x, y, layerResultFlat);
+                    decorator.WriteSplatPixel(x, y, splatMap);
+                }
+            }
+
+            return true;
+        }
+        finally
+        {
+            ruleBuffer.Release();
+            layerBuffer.Release();
+            layerFlatBuffer.Release();
+            splatScratchBuffer.Release();
+            layerWeightsArray.Release();
+            if (ownsMaskArray)
+                UnityEngine.Object.DestroyImmediate(maskArray);
+        }
+    }
+
+    static bool VerifyLayerWeightParity(
+        TerrainDecorator decorator,
+        TerrainData data,
+        float[] gpuFlat,
+        out float[] cpuFlat)
+    {
+        int w = data.alphamapWidth;
+        int h = data.alphamapHeight;
+        int textureLayerCount = data.terrainLayers.Length;
+        float[,,] refMap = new float[w, h, textureLayerCount];
+        decorator.DecorateSplatCpu(refMap, out cpuFlat);
+
+        float maxDiff = 0f;
+        int maxIdx = -1;
+        int pixelCount = w * h;
+        int decorLayerCount = decorator.layers.Count;
+        int n = Mathf.Min(gpuFlat.Length, cpuFlat.Length);
+        for (int i = 0; i < n; i++)
+        {
+            int layerNo = i / pixelCount;
+            if (layerNo >= decorLayerCount || !decorator.layers[layerNo].active)
+                continue;
+
+            float d = Mathf.Abs(gpuFlat[i] - cpuFlat[i]);
+            if (d > maxDiff)
+            {
+                maxDiff = d;
+                maxIdx = i;
+            }
+        }
+
+        if (maxDiff > ParityEpsilon)
+        {
+            LogFirstParityMismatch(gpuFlat, cpuFlat, w, h, decorLayerCount, decorator);
+            if (maxIdx >= 0)
+            {
+                int layerNo = maxIdx / pixelCount;
+                int rem = maxIdx % pixelCount;
+                int mx = rem % w;
+                int my = rem / w;
+                Debug.LogWarning(
+                    $"TerrainDecorator GPU parity worst: layer={layerNo} ({mx},{my}) cpu={cpuFlat[maxIdx]:F4} gpu={gpuFlat[maxIdx]:F4} diff={maxDiff:F4}");
+            }
+            Debug.LogWarning($"TerrainDecorator GPU parity: max layer-weight diff vs CPU = {maxDiff:E3}.");
+            return false;
+        }
+
+        Debug.Log($"TerrainDecorator GPU parity: OK (max diff {maxDiff:E3}).");
+        return true;
+    }
+
+    static bool BuildRulesAndLayers(
+        TerrainDecorator decorator,
+        TerrainDecoratorBakeContext bake,
+        int alphamapWidth,
+        int alphamapHeight,
+        int pixelCount,
+        out List<RuleDataGpu> rulesGpu,
+        out List<LayerDataGpu> layersGpu,
+        out Texture2DArray maskArray)
+    {
+        rulesGpu = new List<RuleDataGpu>();
+        layersGpu = new List<LayerDataGpu>();
+        maskArray = null;
+
         var maskTextures = new List<Texture2D>();
         var noiseMaskIndex = new Dictionary<string, int>();
+        var textureMaskIndex = new Dictionary<string, int>();
+        int decorLayerCount = decorator.layers.Count;
 
         for (int layerNo = 0; layerNo < decorLayerCount; layerNo++)
         {
@@ -147,25 +296,44 @@ public static class TerrainDecoratorGpu
                 int maskIndex = -1;
                 if (rule.filter == TerrainDecorator.FilterType.texture && rule.active && rule.map != null)
                 {
-                    if (maskTextures.Count >= MaxMaskTextures)
+                    string texKey = TerrainDecoratorBakeContext.TextureMaskKey(layerNo, i);
+                    if (!textureMaskIndex.TryGetValue(texKey, out maskIndex))
                     {
-                        Debug.LogWarning("TerrainDecorator GPU: too many mask textures. Using CPU.");
-                        return false;
+                        if (maskTextures.Count >= MaxMaskTextures)
+                        {
+                            Debug.LogWarning("TerrainDecorator GPU: too many mask textures. Using CPU.");
+                            CleanupMaskTextures(maskTextures);
+                            return false;
+                        }
+                        if (!bake.TextureMaskMaps.TryGetValue(texKey, out float[] maskFlat))
+                        {
+                            maskFlat = new float[pixelCount];
+                            for (int y = 0; y < alphamapHeight; y++)
+                            for (int x = 0; x < alphamapWidth; x++)
+                                maskFlat[y * alphamapWidth + x] = TerrainDecoratorSampling.SampleTextureMask(
+                                    rule.map, x, y, alphamapWidth, rule.imageChannel);
+                        }
+                        maskIndex = AddMaskFromFloatMap(maskTextures, maskFlat, alphamapWidth, alphamapHeight);
+                        textureMaskIndex[texKey] = maskIndex;
                     }
-                    maskIndex = AddMaskFromColorMap(maskTextures, rule.map, alphamapWidth, alphamapHeight);
                 }
                 else if (rule.filter == TerrainDecorator.FilterType.noise && rule.active)
                 {
-                    string noiseKey = rule.frequency.ToString("R") + "_" + rule.lacunarity.ToString("R");
+                    string noiseKey = TerrainDecoratorBakeContext.NoiseKey(rule.frequency, rule.lacunarity);
                     if (!noiseMaskIndex.TryGetValue(noiseKey, out maskIndex))
                     {
                         if (maskTextures.Count >= MaxMaskTextures)
                         {
                             Debug.LogWarning("TerrainDecorator GPU: too many mask textures. Using CPU.");
+                            CleanupMaskTextures(maskTextures);
                             return false;
                         }
-                        var noiseFlat = new float[pixelCount];
-                        TerrainDecoratorSampling.BakeNoiseMap(decorator, alphamapWidth, alphamapHeight, rule.frequency, rule.lacunarity, noiseFlat);
+                        if (!bake.NoiseMaps.TryGetValue(noiseKey, out float[] noiseFlat))
+                        {
+                            noiseFlat = new float[pixelCount];
+                            TerrainDecoratorSampling.BakeNoiseMap(decorator, alphamapWidth, alphamapHeight,
+                                rule.frequency, rule.lacunarity, noiseFlat);
+                        }
                         maskIndex = AddMaskFromFloatMap(maskTextures, noiseFlat, alphamapWidth, alphamapHeight);
                         noiseMaskIndex[noiseKey] = maskIndex;
                     }
@@ -199,154 +367,112 @@ public static class TerrainDecoratorGpu
             });
         }
 
-        const int ruleStride = 64;
-        const int layerStride = 32;
-        ComputeBuffer ruleBuffer = new ComputeBuffer(Mathf.Max(rulesGpu.Count, 1), ruleStride);
-        ComputeBuffer layerBuffer = new ComputeBuffer(Mathf.Max(layersGpu.Count, 1), layerStride);
-        if (rulesGpu.Count > 0)
-            ruleBuffer.SetData(rulesGpu);
-        if (layersGpu.Count > 0)
-            layerBuffer.SetData(layersGpu);
-
-        ComputeBuffer heightBuffer = new ComputeBuffer(pixelCount, sizeof(float));
-        ComputeBuffer slopeBuffer = new ComputeBuffer(pixelCount, sizeof(float));
-        ComputeBuffer falloffBuffer = new ComputeBuffer(pixelCount, sizeof(float));
-        heightBuffer.SetData(heightFlat);
-        slopeBuffer.SetData(slopeFlat);
-        falloffBuffer.SetData(falloffFlat);
-
-        Texture2DArray inputAlphamap = TerrainDecoratorSampling.BakePaintedAlphamapTexture(decorator, data, alphamapWidth, alphamapHeight)
-            ?? CreateDummyTexture2DArray(alphamapWidth, alphamapHeight, 1);
-        Texture2DArray maskArray = BuildMaskTextureArray(maskTextures, alphamapWidth, alphamapHeight)
-            ?? CreateDummyTexture2DArray(alphamapWidth, alphamapHeight, 1);
-
-        int layerFlatCount = Mathf.Max(decorLayerCount, 1) * pixelCount;
-        ComputeBuffer layerFlatBuffer = new ComputeBuffer(layerFlatCount, sizeof(float));
-        int splatScratchCount = Mathf.Max(pixelCount * textureLayerCount, 1);
-        ComputeBuffer splatScratchBuffer = new ComputeBuffer(splatScratchCount, sizeof(float));
-
-        var layerWeightsArray = new RenderTexture(alphamapWidth, alphamapHeight, 0, RenderTextureFormat.RFloat)
+        if (maskTextures.Count > 0)
         {
-            dimension = TextureDimension.Tex2DArray,
-            volumeDepth = Mathf.Max(decorLayerCount, 1),
-            enableRandomWrite = true
-        };
-        layerWeightsArray.Create();
-
-        bool useScanline = HasActiveLayerFilterRule(decorator);
-
-        try
-        {
-            int kernel = useScanline ? _kernelScanline : _kernelEvaluate;
-            BindEvaluate(_compute, kernel, heightBuffer, slopeBuffer, falloffBuffer, inputAlphamap, maskArray,
-                ruleBuffer, layerBuffer, layerWeightsArray, layerFlatBuffer, splatScratchBuffer,
-                alphamapWidth, alphamapHeight, heightmapHeight, textureLayerCount, decorLayerCount, decorator);
-
-            if (useScanline)
-            {
-                splatScratchBuffer.SetData(new float[splatScratchCount]);
-                _compute.Dispatch(_kernelScanline, 1, alphamapHeight, 1);
-            }
-            else
-            {
-                int gx = Mathf.CeilToInt(alphamapWidth / (float)ThreadGroupSize);
-                int gy = Mathf.CeilToInt(alphamapHeight / (float)ThreadGroupSize);
-                _compute.Dispatch(_kernelEvaluate, gx, gy, Mathf.Max(decorLayerCount, 1));
-            }
-
-            layerResultFlat = new float[layerFlatCount];
-            layerFlatBuffer.GetData(layerResultFlat);
-
-            LogParityVsCpu(decorator, data, alphamapWidth, alphamapHeight, layerResultFlat);
-
-            splatMap = new float[alphamapWidth, alphamapHeight, textureLayerCount];
-            for (int y = 0; y < alphamapHeight; y++)
-            {
-                for (int x = 0; x < alphamapWidth; x++)
-                {
-                    decorator.ApplyLayerWeightsForPixel(x, y, layerResultFlat);
-                    decorator.WriteSplatPixel(x, y, splatMap);
-                }
-            }
-
-            return true;
+            maskArray = BuildMaskTextureArray(maskTextures, alphamapWidth, alphamapHeight);
+            CleanupMaskTextures(maskTextures);
         }
-        finally
-        {
-            ruleBuffer.Release();
-            layerBuffer.Release();
-            layerFlatBuffer.Release();
-            splatScratchBuffer.Release();
-            heightBuffer.Release();
-            slopeBuffer.Release();
-            falloffBuffer.Release();
-            layerWeightsArray.Release();
-            for (int i = 0; i < maskTextures.Count; i++)
-                UnityEngine.Object.DestroyImmediate(maskTextures[i]);
-            UnityEngine.Object.DestroyImmediate(inputAlphamap);
-            UnityEngine.Object.DestroyImmediate(maskArray);
-        }
+
+        return true;
     }
 
-    static void LogParityVsCpu(
-        TerrainDecorator decorator,
-        TerrainData data,
+    static void UploadRuleBuffer(ComputeBuffer buffer, List<RuleDataGpu> rules)
+    {
+        if (rules.Count == 0)
+            return;
+
+        const int intsPerRule = RuleStrideBytes / sizeof(int);
+        var packed = new int[rules.Count * intsPerRule];
+        for (int i = 0; i < rules.Count; i++)
+        {
+            var r = rules[i];
+            int o = i * intsPerRule;
+            packed[o + 0] = r.filter;
+            packed[o + 1] = r.blend;
+            packed[o + 2] = r.active;
+            packed[o + 3] = r.imageChannel;
+            packed[o + 4] = r.targetLayerIndex;
+            packed[o + 5] = r.maskTextureIndex;
+            WriteFloatAsInt(packed, o + 6, r.minVal);
+            WriteFloatAsInt(packed, o + 7, r.maxVal);
+            WriteFloatAsInt(packed, o + 8, r.frequency);
+            WriteFloatAsInt(packed, o + 9, r.lacunarity);
+            WriteFloatAsInt(packed, o + 10, r.intensity);
+            WriteFloatAsInt(packed, o + 11, r.contrast);
+            packed[o + 12] = r.paintedLayerIndex;
+            packed[o + 13] = r.pad0;
+            packed[o + 14] = r.pad1;
+            packed[o + 15] = r.pad2;
+        }
+        buffer.SetData(packed);
+    }
+
+    static void UploadLayerBuffer(ComputeBuffer buffer, List<LayerDataGpu> layers)
+    {
+        if (layers.Count == 0)
+            return;
+
+        const int intsPerLayer = LayerStrideBytes / sizeof(int);
+        var packed = new int[layers.Count * intsPerLayer];
+        for (int i = 0; i < layers.Count; i++)
+        {
+            var layer = layers[i];
+            int o = i * intsPerLayer;
+            packed[o + 0] = layer.active;
+            packed[o + 1] = layer.layerIndex;
+            packed[o + 2] = layer.activeRuleCount;
+            packed[o + 3] = layer.ruleStart;
+            packed[o + 4] = layer.ruleCount;
+            packed[o + 5] = layer.pad0;
+            packed[o + 6] = layer.pad1;
+            packed[o + 7] = layer.pad2;
+        }
+        buffer.SetData(packed);
+    }
+
+    static void WriteFloatAsInt(int[] packed, int index, float value)
+    {
+        packed[index] = BitConverter.SingleToInt32Bits(value);
+    }
+
+    static void LogFirstParityMismatch(
+        float[] gpuFlat,
+        float[] cpuFlat,
         int w,
         int h,
-        float[] gpuFlat)
+        int decorLayerCount,
+        TerrainDecorator decorator)
     {
-        int decorCount = decorator.layers.Count;
         int pixelCount = w * h;
-        int textureLayerCount = data.terrainLayers.Length;
-        float maxDiff = 0f;
-        bool useLayerFilter = HasActiveLayerFilterRule(decorator);
-
-        if (useLayerFilter)
+        for (int layerNo = 0; layerNo < decorLayerCount; layerNo++)
         {
-            float[,,] cpuMap = new float[w, h, textureLayerCount];
+            if (!decorator.layers[layerNo].active)
+                continue;
+
             for (int y = 0; y < h; y++)
             {
                 for (int x = 0; x < w; x++)
                 {
-                    Vector2 nPos = TerrainDecoratorSampling.AlphamapNorm(x, y, w, h);
-                    decorator.EvaluateLayersAtPixel(nPos, x, y);
-                    decorator.WriteSplatPixel(x, y, cpuMap);
-
-                    int pixelIndex = y * w + x;
-                    for (int layerNo = 0; layerNo < decorCount; layerNo++)
+                    int idx = layerNo * pixelCount + y * w + x;
+                    if (idx >= gpuFlat.Length || idx >= cpuFlat.Length)
+                        return;
+                    float d = Mathf.Abs(gpuFlat[idx] - cpuFlat[idx]);
+                    if (d > ParityEpsilon)
                     {
-                        float cpu = decorator.layers[layerNo].resultWeight;
-                        float gpu = gpuFlat[layerNo * pixelCount + pixelIndex];
-                        maxDiff = Mathf.Max(maxDiff, Mathf.Abs(cpu - gpu));
+                        Debug.LogWarning(
+                            $"TerrainDecorator GPU parity sample: layer={layerNo} ({x},{y}) cpu={cpuFlat[idx]:F4} gpu={gpuFlat[idx]:F4}");
+                        return;
                     }
                 }
             }
         }
-        else
-        {
-            int samples = Mathf.Min(64, pixelCount);
-            var rng = new System.Random(42);
-            for (int s = 0; s < samples; s++)
-            {
-                int x = rng.Next(0, w);
-                int y = rng.Next(0, h);
-                Vector2 nPos = TerrainDecoratorSampling.AlphamapNorm(x, y, w, h);
-                decorator.EvaluateLayersAtPixel(nPos, x, y);
+    }
 
-                int pixelIndex = y * w + x;
-                for (int layerNo = 0; layerNo < decorCount; layerNo++)
-                {
-                    float cpu = decorator.layers[layerNo].resultWeight;
-                    float gpu = gpuFlat[layerNo * pixelCount + pixelIndex];
-                    maxDiff = Mathf.Max(maxDiff, Mathf.Abs(cpu - gpu));
-                }
-            }
-        }
-
-        if (maxDiff > 1e-4f)
-            Debug.LogWarning($"TerrainDecorator GPU parity: max layer-weight diff vs CPU = {maxDiff:E3}. Filters: Height/Slope/Painted/Noise/Texture/Layer.");
-        else
-            Debug.Log($"TerrainDecorator GPU parity: OK (max diff {maxDiff:E3}). All filter types use CPU-matched bake/eval.");
+    static void CleanupMaskTextures(List<Texture2D> masks)
+    {
+        for (int i = 0; i < masks.Count; i++)
+            UnityEngine.Object.DestroyImmediate(masks[i]);
+        masks.Clear();
     }
 
     static bool TryDecorateSplatCpuEvaluate(
@@ -371,10 +497,8 @@ public static class TerrainDecoratorGpu
         var tex = new Texture2D(width, height, TextureFormat.RGBA32, false, true);
         var pixels = new Color[width * height];
         for (int y = 0; y < height; y++)
-        {
-            for (int x = 0; x < width; x++)
-                pixels[y * width + x] = map[y * width + (width - x - 1)];
-        }
+        for (int x = 0; x < width; x++)
+            pixels[y * width + x] = map[y * width + (width - x - 1)];
         tex.SetPixels(pixels);
         tex.Apply(false, false);
         tex.wrapMode = TextureWrapMode.Clamp;
@@ -386,7 +510,7 @@ public static class TerrainDecoratorGpu
     static int AddMaskFromFloatMap(List<Texture2D> masks, float[] values, int width, int height)
     {
         var tex = new Texture2D(width, height, TextureFormat.RGBA32, false, true);
-        var pixels = new Color[width * height];
+        var pixels = new Color[values.Length];
         for (int i = 0; i < values.Length; i++)
             pixels[i] = new Color(values[i], values[i], values[i], 1f);
         tex.SetPixels(pixels);

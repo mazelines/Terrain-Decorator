@@ -1,4 +1,4 @@
-using System.Collections;
+﻿using System.Collections;
 using System.Collections.Generic;
 using UnityEngine;
 using UnityEditor;
@@ -109,8 +109,17 @@ public class TerrainDecorator : MonoBehaviour
 	[Tooltip("Editor only. Uses GPU pipeline (rule evaluate + splat). Falls back to full CPU when Layer filter rules are active.")]
 	public bool useGpuDecorate = true;
 
-	[Tooltip("Experimental. GPU compute for rule weights. Off = CPU rule evaluate (matches full CPU decorate).")]
+	[Tooltip("GPU compute for rule weights. Off = CPU rule evaluate (same bake as full CPU).")]
 	public bool useGpuRuleEvaluate = false;
+
+	[Tooltip("Cache height/slope/painted/noise bakes between Decorate runs (CPU and GPU).")]
+	public bool useBakeCache = true;
+
+#if UNITY_EDITOR
+	[System.NonSerialized]
+	TerrainDecoratorBakeContext _activeBake;
+	float[] _splatScratchWeights;
+#endif
 	
 	void OnEnable() {
 		
@@ -234,8 +243,13 @@ public class TerrainDecorator : MonoBehaviour
 	}
 	public int smoothcount=1;
 	
-	public void EvaluateLayersAtPixel(Vector2 nPos, int x, int y)
+	public void EvaluateLayersAtPixel(Vector2 nPos, int x, int y, float[,,] splatMapForLayer = null)
 	{
+#if UNITY_EDITOR
+		var bake = _activeBake;
+#endif
+		float[,,] layerSplat = splatMapForLayer ?? map;
+
 		for (int layerNo = 0; layerNo < layers.Count; layerNo++)
 		{
 			float layerResultWeight = 0;
@@ -256,34 +270,74 @@ public class TerrainDecorator : MonoBehaviour
 
 					if (rule.filter == FilterType.slope)
 					{
+#if UNITY_EDITOR
+						float angle = bake != null
+							? bake.SampleSlope(x, y)
+							: TerrainDecoratorSampling.SampleSlope(t.terrainData, x, y, alphamapWidth, alphamapHeight);
+#else
 						float angle = TerrainDecoratorSampling.SampleSlope(t.terrainData, x, y, alphamapWidth, alphamapHeight);
+#endif
 						weight = CalculateWeigth(angle, rule.min, rule.max, heightMapHeight / 256);
 					}
 
 					if (rule.filter == FilterType.height)
 					{
+#if UNITY_EDITOR
+						float _height = bake != null
+							? bake.SampleHeight(x, y)
+							: TerrainDecoratorSampling.SampleHeightWorld(this, t.terrainData, x, y, alphamapWidth, alphamapHeight);
+#else
 						float _height = TerrainDecoratorSampling.SampleHeightWorld(this, t.terrainData, x, y, alphamapWidth, alphamapHeight);
+#endif
 						weight = CalculateWeigth(_height, rule.min, rule.max, heightMapHeight / 512f * fallOffDistance);
 					}
 
 					if (rule.filter == FilterType.painted)
+					{
+#if UNITY_EDITOR
+						weight = bake != null
+							? bake.SamplePainted(layers[layerNo].layerIndex, x, y)
+							: TerrainDecoratorSampling.SamplePainted(this, layers[layerNo].layerIndex, x, y);
+#else
 						weight = TerrainDecoratorSampling.SamplePainted(this, layers[layerNo].layerIndex, x, y);
+#endif
+					}
 
 					if (rule.filter == FilterType.texture && rule.map != null)
-						weight = TerrainDecoratorSampling.SampleTextureMask(rule.map, x, y, alphamapWidth, rule.imageChannel);
+					{
+#if UNITY_EDITOR
+						if (bake != null && bake.TrySampleTextureMask(layerNo, i, x, y, out float texBaked))
+							weight = texBaked;
+						else
+#endif
+							weight = TerrainDecoratorSampling.SampleTextureMask(rule.map, x, y, alphamapWidth, rule.imageChannel);
+					}
 
 					if (rule.filter == FilterType.noise)
-						weight = TerrainDecoratorSampling.SampleNoise(this, x, y, alphamapWidth, alphamapHeight, rule.frequency, rule.lacunarity);
+					{
+#if UNITY_EDITOR
+						if (bake != null && bake.TrySampleNoise(rule.frequency, rule.lacunarity, x, y, out float noiseBaked))
+							weight = noiseBaked;
+						else
+#endif
+							weight = TerrainDecoratorSampling.SampleNoise(this, x, y, alphamapWidth, alphamapHeight, rule.frequency, rule.lacunarity);
+					}
 
 					if (rule.filter == FilterType.layer)
 					{
 						if (rule.targetLayerIndex < textureLayerCount && x > 1 && y > 1)
-							weight = map[x - 1, y - 1, rule.targetLayerIndex];
+							weight = layerSplat[x - 1, y - 1, rule.targetLayerIndex];
 					}
 
 					if (rule.filter == FilterType.height && fallOfNoise && weight < 1 && weight > 0)
 					{
+#if UNITY_EDITOR
+						float noise = bake != null
+							? bake.SampleFalloffNoise(x, y)
+							: TerrainDecoratorSampling.SampleFalloffNoise(this, x, y, alphamapWidth, alphamapHeight);
+#else
 						float noise = TerrainDecoratorSampling.SampleFalloffNoise(this, x, y, alphamapWidth, alphamapHeight);
+#endif
 						weight = Mathf.Clamp((noise - 0.5f) * 2f * fallofNoiseAmplitude * (1 - weight) + weight, 0f, 1f);
 					}
 
@@ -317,6 +371,8 @@ public class TerrainDecorator : MonoBehaviour
 
 				layers[layerNo].resultWeight = Mathf.Clamp(layerResultWeight, 0, 1f);
 			}
+			else
+				layers[layerNo].resultWeight = 0f;
 		}
 	}
 
@@ -382,22 +438,38 @@ public class TerrainDecorator : MonoBehaviour
 		layerResultFlat = new float[Mathf.Max(decorLayerCount, 1) * pixelCount];
 
 		ProcessTextureFilters();
+		TerrainDecoratorBakeCache.TryAcquire(this, t.terrainData, useBakeCache, out var bake);
+		_activeBake = bake;
 
-		for (int y = 0; y < alphamapHeight; y++)
+		try
 		{
-			for (int x = 0; x < alphamapWidth; x++)
+			for (int y = 0; y < alphamapHeight; y++)
 			{
-				float normX = x * 1.0f / (alphamapWidth - 1);
-				float normY = y * 1.0f / (alphamapHeight - 1);
-				EvaluateLayersAtPixel(new Vector2(normX, normY), x, y);
+				for (int x = 0; x < alphamapWidth; x++)
+				{
+					float normX = x * 1.0f / (alphamapWidth - 1);
+					float normY = y * 1.0f / (alphamapHeight - 1);
+					EvaluateLayersAtPixel(new Vector2(normX, normY), x, y, targetMap);
 
-				int pixelIndex = y * alphamapWidth + x;
-				for (int layerNo = 0; layerNo < decorLayerCount; layerNo++)
-					layerResultFlat[layerNo * pixelCount + pixelIndex] = layers[layerNo].resultWeight;
+					int pixelIndex = y * alphamapWidth + x;
+					for (int layerNo = 0; layerNo < decorLayerCount; layerNo++)
+						layerResultFlat[layerNo * pixelCount + pixelIndex] = layers[layerNo].resultWeight;
 
-				WriteSplatPixel(x, y, targetMap);
+					WriteSplatPixel(x, y, targetMap);
+				}
 			}
 		}
+		finally
+		{
+			_activeBake = null;
+		}
+	}
+
+	void EnsureSplatScratchWeights()
+	{
+		int needed = textureLayerCount + treePrototypeCount;
+		if (_splatScratchWeights == null || _splatScratchWeights.Length < needed)
+			_splatScratchWeights = new float[needed];
 	}
 
 	public void ApplyLayerWeightsForPixel(int x, int y, float[] layerResultFlat)
@@ -410,7 +482,9 @@ public class TerrainDecorator : MonoBehaviour
 
 	public void WriteSplatPixel(int x, int y, float[,,] targetMap)
 	{
-		float[] weights = new float[textureLayerCount + treePrototypeCount];
+		EnsureSplatScratchWeights();
+		float[] weights = _splatScratchWeights;
+		System.Array.Clear(weights, 0, weights.Length);
 		float totalWeight = 0f;
 		float kalan = 1f;
 
