@@ -181,10 +181,13 @@ public static class TerrainDecoratorGpu
             layerResultFlat = new float[layerFlatCount];
             layerFlatBuffer.GetData(layerResultFlat);
 
-            if (!VerifyLayerWeightParity(decorator, data, layerResultFlat, out float[] cpuFlat))
+            if (decorator.verifyGpuParity)
             {
-                Debug.LogWarning("TerrainDecorator GPU: parity failed — using CPU rule evaluate for this Decorate.");
-                layerResultFlat = cpuFlat;
+                if (!VerifyLayerWeightParity(decorator, data, layerResultFlat, out float[] cpuFlat))
+                {
+                    Debug.LogWarning("TerrainDecorator GPU: parity failed — using CPU rule evaluate for this Decorate.");
+                    layerResultFlat = cpuFlat;
+                }
             }
 
             splatMap = new float[alphamapWidth, alphamapHeight, textureLayerCount];

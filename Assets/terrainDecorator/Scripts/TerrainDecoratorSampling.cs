@@ -81,6 +81,24 @@ public static class TerrainDecoratorSampling
         return decorator.GetWeight(layerIndex, y, x);
     }
 
+    /// <summary>GetAlphamaps(0,0,w,h) 1회로 Painted 베이크 (픽셀마다 GetAlphamaps 방지).</summary>
+    public static void BakePaintedAlphamap(TerrainData data, float[] output, int width, int height)
+    {
+        int layerCount = data.terrainLayers.Length;
+        if (layerCount <= 0 || output == null || output.Length == 0)
+            return;
+
+        float[,,] maps = data.GetAlphamaps(0, 0, width, height);
+        int pixelCount = width * height;
+        for (int layer = 0; layer < layerCount; layer++)
+        {
+            int layerOffset = layer * pixelCount;
+            for (int y = 0; y < height; y++)
+            for (int x = 0; x < width; x++)
+                output[layerOffset + y * width + x] = maps[y, x, layer];
+        }
+    }
+
     public static float SampleTextureMask(Color[] map, int x, int y, int alphamapWidth, TerrainDecorator.ImageChannel channel)
     {
         int idx = y * alphamapWidth + (alphamapWidth - x - 1);
@@ -144,18 +162,17 @@ public static class TerrainDecoratorSampling
         if (layerCount <= 0)
             return null;
 
+        int pixelCount = width * height;
+        var flat = new float[layerCount * pixelCount];
+        BakePaintedAlphamap(data, flat, width, height);
+
         var array = new Texture2DArray(width, height, layerCount, TextureFormat.RGBA32, false, true);
         for (int layer = 0; layer < layerCount; layer++)
         {
-            var pixels = new Color[width * height];
-            for (int y = 0; y < height; y++)
-            {
-                for (int x = 0; x < width; x++)
-                {
-                    float w = SamplePainted(decorator, layer, x, y);
-                    pixels[y * width + x] = new Color(w, 0f, 0f, 1f);
-                }
-            }
+            var pixels = new Color[pixelCount];
+            int offset = layer * pixelCount;
+            for (int i = 0; i < pixelCount; i++)
+                pixels[i] = new Color(flat[offset + i], 0f, 0f, 1f);
             array.SetPixels(pixels, layer);
         }
         array.Apply(false, false);

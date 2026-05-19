@@ -508,13 +508,22 @@ public class TerrainDecoratorEditor : Editor {
 		if (decorator.useGpuDecorate)
 		{
 			EditorGUILayout.HelpBox(
-				"Height, Slope, Painted, Noise, Texture, Layer supported. Splat compositing stays on CPU (WriteSplatPixel). Layer filter uses GPU scanline.",
+				"GPU rule evaluate: rule weights on GPU. Splat blend (WriteSplatPixel) is still CPU. GPU splat path alone does nothing unless GPU rule evaluate is on.",
 				MessageType.None);
 			decorator.useGpuRuleEvaluate = EditorGUILayout.Toggle("GPU rule evaluate", decorator.useGpuRuleEvaluate);
+			if (decorator.useGpuRuleEvaluate)
+			{
+				decorator.verifyGpuParity = EditorGUILayout.Toggle("Verify GPU parity (2× CPU cost)", decorator.verifyGpuParity);
+				if (decorator.verifyGpuParity)
+					EditorGUILayout.HelpBox("Runs a full CPU decorate to compare weights. Turn off for normal speed.", MessageType.Warning);
+			}
 		}
 		if (decorator.useGpuDecorate && TerrainDecoratorGpu.HasActiveLayerFilterRule(decorator))
 			EditorGUILayout.HelpBox("Layer filter active: GPU uses scanline pass (pixel-order splat dependency).", MessageType.Info);
-		decorator.showProgress = EditorGUILayout.Toggle("show progress ( experimental)", decorator.showProgress);
+		decorator.showProgress = EditorGUILayout.Toggle("Preview splat while decorating", decorator.showProgress);
+		EditorGUILayout.HelpBox(
+			"Decorate runs over multiple editor frames (progress bar). First run still bakes height/slope maps; enable Bake cache to skip repeat bakes.",
+			MessageType.None);
 		decorator.fallOfNoise = EditorGUILayout.Toggle("transition Noise", decorator.fallOfNoise);
 
 

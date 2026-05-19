@@ -112,6 +112,9 @@ public class TerrainDecorator : MonoBehaviour
 	[Tooltip("GPU compute for rule weights. Off = CPU rule evaluate (same bake as full CPU).")]
 	public bool useGpuRuleEvaluate = false;
 
+	[Tooltip("After GPU rule evaluate, run full CPU decorate once and compare (slow; for debugging only).")]
+	public bool verifyGpuParity = false;
+
 	[Tooltip("Cache height/slope/painted/noise bakes between Decorate runs (CPU and GPU).")]
 	public bool useBakeCache = true;
 
@@ -430,14 +433,52 @@ public class TerrainDecorator : MonoBehaviour
 	}
 
 #if UNITY_EDITOR
-	/// <summary>CPU Decorate와 동일한 룰 평가 + WriteSplatPixel. GPU fast path도 이 함수를 사용합니다.</summary>
+	const int DecorateYieldRows = 32;
+
+	/// <summary>CPU Decorate와 동일한 룰 평가 + WriteSplatPixel. GPU 패리티/폴백용 동기 경로.</summary>
 	public void DecorateSplatCpu(float[,,] targetMap, out float[] layerResultFlat)
 	{
 		int decorLayerCount = layers.Count;
 		int pixelCount = alphamapWidth * alphamapHeight;
 		layerResultFlat = new float[Mathf.Max(decorLayerCount, 1) * pixelCount];
 
-		ProcessTextureFilters();
+		TerrainDecoratorBakeCache.TryAcquire(this, t.terrainData, useBakeCache, out var bake);
+		_activeBake = bake;
+
+		try
+		{
+			for (int y = 0; y < alphamapHeight; y++)
+			for (int x = 0; x < alphamapWidth; x++)
+				EvaluateAndWriteSplatPixel(targetMap, layerResultFlat, decorLayerCount, pixelCount, x, y);
+		}
+		finally
+		{
+			_activeBake = null;
+		}
+	}
+
+	void EvaluateAndWriteSplatPixel(float[,,] targetMap, float[] layerResultFlat, int decorLayerCount, int pixelCount, int x, int y)
+	{
+		float normX = x * 1.0f / (alphamapWidth - 1);
+		float normY = y * 1.0f / (alphamapHeight - 1);
+		EvaluateLayersAtPixel(new Vector2(normX, normY), x, y, targetMap);
+
+		int pixelIndex = y * alphamapWidth + x;
+		for (int layerNo = 0; layerNo < decorLayerCount; layerNo++)
+			layerResultFlat[layerNo * pixelCount + pixelIndex] = layers[layerNo].resultWeight;
+
+		WriteSplatPixel(x, y, targetMap);
+	}
+
+	public IEnumerator DecorateSplatCpuCoroutine(float[,,] targetMap, System.Action<float[]> onComplete)
+	{
+		int decorLayerCount = layers.Count;
+		int pixelCount = alphamapWidth * alphamapHeight;
+		var layerResultFlat = new float[Mathf.Max(decorLayerCount, 1) * pixelCount];
+
+		EditorUtility.DisplayProgressBar("Decorate", "Baking input maps…", 0.02f);
+		yield return null;
+
 		TerrainDecoratorBakeCache.TryAcquire(this, t.terrainData, useBakeCache, out var bake);
 		_activeBake = bake;
 
@@ -445,23 +486,57 @@ public class TerrainDecorator : MonoBehaviour
 		{
 			for (int y = 0; y < alphamapHeight; y++)
 			{
-				for (int x = 0; x < alphamapWidth; x++)
+				if (y % DecorateYieldRows == 0)
 				{
-					float normX = x * 1.0f / (alphamapWidth - 1);
-					float normY = y * 1.0f / (alphamapHeight - 1);
-					EvaluateLayersAtPixel(new Vector2(normX, normY), x, y, targetMap);
-
-					int pixelIndex = y * alphamapWidth + x;
-					for (int layerNo = 0; layerNo < decorLayerCount; layerNo++)
-						layerResultFlat[layerNo * pixelCount + pixelIndex] = layers[layerNo].resultWeight;
-
-					WriteSplatPixel(x, y, targetMap);
+					float progress = (float)y / Mathf.Max(alphamapHeight, 1);
+					EditorUtility.DisplayProgressBar("Decorate", "Splat rules…", progress);
+					calculatingPercent = progress;
+					if (showProgress)
+						t.terrainData.SetAlphamaps(0, 0, targetMap);
+					yield return null;
 				}
+
+				for (int x = 0; x < alphamapWidth; x++)
+					EvaluateAndWriteSplatPixel(targetMap, layerResultFlat, decorLayerCount, pixelCount, x, y);
 			}
 		}
 		finally
 		{
 			_activeBake = null;
+		}
+
+		onComplete?.Invoke(layerResultFlat);
+	}
+
+	public IEnumerator PlaceTreesFromLayerWeightsCoroutine(float[] layerWeights)
+	{
+		int decorCount = layers.Count;
+		int pixelCount = alphamapWidth * alphamapHeight;
+		for (int y = 0; y < alphamapHeight; y++)
+		{
+			if (y % DecorateYieldRows == 0)
+			{
+				float progress = (float)y / Mathf.Max(alphamapHeight, 1);
+				EditorUtility.DisplayProgressBar("Decorate", "Placing trees…", progress);
+				calculatingPercent = progress;
+				yield return null;
+			}
+
+			for (int x = 0; x < alphamapWidth; x++)
+			{
+				int pixelIndex = y * alphamapWidth + x;
+				for (int layerNo = 0; layerNo < decorCount; layerNo++)
+				{
+					float w = layerWeights[layerNo * pixelCount + pixelIndex];
+					layers[layerNo].resultWeight = w;
+					if (debugPos.x == x && debugPos.y == y)
+						layers[layerNo].debugResultWeight = Mathf.Clamp(w, 0f, 1f);
+				}
+
+				float normX = x * 1.0f / (alphamapWidth - 1);
+				float normY = y * 1.0f / (alphamapHeight - 1);
+				ApplyTreesAtPixel(new Vector2(normX, normY), x, y);
+			}
 		}
 	}
 
@@ -601,51 +676,31 @@ public class TerrainDecorator : MonoBehaviour
 			}
 		}
 
+		yield return null;
+
 		bool usedGpuSplat = false;
-		if (useGpuDecorate)
+		float[] layerWeights = null;
+
+		if (useGpuDecorate && useGpuRuleEvaluate)
 		{
-			if (TerrainDecoratorGpu.TryDecorateSplat(this, out float[,,] gpuMap, out float[] layerWeights))
+			EditorUtility.DisplayProgressBar("Decorate", "GPU rule evaluate…", 0.1f);
+			yield return null;
+			if (TerrainDecoratorGpu.TryDecorateSplat(this, out float[,,] gpuMap, out layerWeights))
 			{
 				map = gpuMap;
-				PlaceTreesFromGpuLayerWeights(layerWeights);
-				t.terrainData.SetAlphamaps(0, 0, map);
 				usedGpuSplat = true;
 			}
 		}
 
 		if (!usedGpuSplat)
 		{
-			if (showProgress)
-			{
-				ProcessTextureFilters();
-				for (int y = 0; y < alphamapHeight; y++)
-				{
-					if (y % 50 == 0)
-					{
-						EditorUtility.DisplayProgressBar("Texture Rules", "Calculating Texture Rules ",
-							Mathf.InverseLerp(0.0f, alphamapWidth, y));
-						calculatingPercent = Mathf.InverseLerp(0.0f, alphamapWidth, y);
-						t.terrainData.SetAlphamaps(0, 0, map);
-						yield return 0;
-					}
-
-					for (int x = 0; x < alphamapWidth; x++)
-					{
-						float normX = x * 1.0f / (alphamapWidth - 1);
-						float normY = y * 1.0f / (alphamapHeight - 1);
-						ProcessLayers(new Vector2(normX, normY), x, y);
-						WriteSplatPixel(x, y, map);
-					}
-				}
-			}
-			else
-			{
-				DecorateSplatCpu(map, out float[] layerWeights);
-				PlaceTreesFromGpuLayerWeights(layerWeights);
-			}
-
-			t.terrainData.SetAlphamaps(0, 0, map);
+			yield return DecorateSplatCpuCoroutine(map, weights => layerWeights = weights);
 		}
+
+		if (layerWeights != null)
+			yield return PlaceTreesFromLayerWeightsCoroutine(layerWeights);
+
+		t.terrainData.SetAlphamaps(0, 0, map);
 			
 			
 			

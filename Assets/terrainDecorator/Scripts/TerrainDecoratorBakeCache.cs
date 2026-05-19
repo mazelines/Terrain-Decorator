@@ -105,13 +105,7 @@ public sealed class TerrainDecoratorBakeContext : IDisposable
         else
             Array.Fill(ctx.FalloffNoise, 0.5f);
 
-        for (int layer = 0; layer < terrainLayerCount; layer++)
-        {
-            for (int y = 0; y < h; y++)
-            for (int x = 0; x < w; x++)
-                ctx.PaintedAlphamap[layer * pixelCount + y * w + x] =
-                    TerrainDecoratorSampling.SamplePainted(decorator, layer, x, y);
-        }
+        TerrainDecoratorSampling.BakePaintedAlphamap(data, ctx.PaintedAlphamap, w, h);
 
         CollectNoiseKeys(decorator, ctx);
         CollectTextureMasks(decorator, ctx);
